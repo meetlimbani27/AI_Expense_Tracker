@@ -1,0 +1,16 @@
+{
+  "name": "openai-langchain-app",
+  "version": "1.0.0",
+  "description": "Application using OpenAI and LangChain",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "langchain": "^0.0.200",
+    "dotenv": "^16.3.1",
+    "@langchain/openai": "^0.0.10",
+    "mongoose": "^8.0.3"
+  }
+}
