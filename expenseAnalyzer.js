@@ -5,6 +5,7 @@ import { ChatPromptTemplate } from "@langchain/core/prompts";
 import readline from 'readline';
 import mongoose from 'mongoose';
 import Expense, { categories } from './models/Expense.js';
+import vectorStore from './services/vectorStore.js';
 
 // Load environment variables
 dotenv.config();
@@ -52,14 +53,64 @@ function createExpensePrompt() {
     }
     
     return `You are an AI expense analyzer. Analyze expense statements and return a JSON object with these exact fields:
-- amount: the numeric value of the expense
-- category: must be one of [${Object.keys(categories).join(', ')}]
+- amount: the numeric value of the expense in Indian Rupees (₹). Extract only the number, do not include the ₹ symbol.
+- category: must be one of [${Object.keys(categories).join(', ')}]. IMPORTANT: Be very specific with categorization:
+  * "Food" is for prepared/restaurant meals
+  * "Groceries" is for raw ingredients/household items
+  * Never combine these categories even if from the same store
 - sub-category: an array with one or more valid subcategories from this list:
 ${categoryText}
-- response: a brief confirmation of the expense
+- response: a brief confirmation of the expense, mentioning the amount with ₹ symbol and being specific about the category
+
+IMPORTANT: 
+1. If the amount is given in dollars ($) or any other currency, convert it to Indian Rupees (₹) using these approximate rates:
+   - 1 USD ($) = ₹83
+   - 1 EUR (€) = ₹90
+   - 1 GBP (£) = ₹105
+2. Be very precise with categories. For stores like DMart that sell multiple categories:
+   - If buying prepared food/meals, categorize as "Food"
+   - If buying groceries/ingredients, categorize as "Groceries"
+   - Never combine these categories
 
 Return ONLY the JSON object, no additional text.`;
 }
+
+// Create summary prompt for search results
+const summaryPrompt = ChatPromptTemplate.fromMessages([
+    ["system", `You are an AI assistant that summarizes expense search results.
+Given a user's query and a list of relevant expenses, provide a concise and informative summary.
+
+IMPORTANT RULES:
+1. Separate expenses by category - never combine amounts from different categories
+2. If searching for a specific category (e.g., "food"), only include expenses from that exact category
+3. For each category mentioned in the query:
+   - Show the total amount spent in that category
+   - List individual expenses within that category
+4. All amounts should be in Indian Rupees (₹)
+5. If a store sells multiple categories (e.g., DMart selling both food and groceries):
+   - Treat each category separately
+   - Do not combine amounts across categories
+   - Clearly indicate which expenses belong to which category
+
+Example Summary Format:
+"For [category]:
+- Total spent: ₹X
+- Individual expenses:
+  * ₹A at [place] on [date]
+  * ₹B at [place] on [date]
+
+For [another category]:
+- Total spent: ₹Y
+- Individual expenses:
+  * ₹C at [place] on [date]"
+
+Keep the summary clear, organized by category, and never mix expenses from different categories.`],
+    ["human", `Query: {query}
+Relevant expenses:
+{expenses}
+
+Provide a summary of these expenses, strictly separating different categories:`]
+]);
 
 // Create the chains
 const intentChain = new LLMChain({
@@ -73,6 +124,11 @@ const expenseChain = new LLMChain({
         ["system", createExpensePrompt()],
         ["human", "{text}"]
     ])
+});
+
+const summaryChain = new LLMChain({
+    llm: model,
+    prompt: summaryPrompt
 });
 
 // Create readline interface
@@ -94,17 +150,50 @@ async function handleAddExpense(text) {
     });
 
     await newExpense.save();
+    
+    // Add to vector store
+    await vectorStore.addExpense(newExpense);
+    
     console.log("Analysis:", result.text);
-    console.log("✅ Expense saved to database");
+    console.log("✅ Expense saved to database and vector store");
 }
 
 async function handleRetrieveExpense(text) {
-    // This will be implemented later with semantic search
-    console.log("🔍 Retrieve intent detected. Query:", text);
-    console.log("💡 Retrieval functionality will be implemented with semantic search");
+    console.log("🔍 Searching expenses...");
+    
+    // Search in vector store
+    const searchResults = await vectorStore.similaritySearch(text);
+    
+    if (searchResults.length === 0) {
+        console.log("❌ No relevant expenses found");
+        return;
+    }
+
+    // Format expenses for summary
+    const expensesText = searchResults
+        .map(doc => doc.pageContent)
+        .join('\n');
+
+    // Generate summary
+    const summary = await summaryChain.call({
+        query: text,
+        expenses: expensesText
+    });
+
+    console.log("\n📊 Summary:");
+    console.log(summary.text);
+    
+    console.log("\n📝 Relevant Expenses:");
+    searchResults.forEach((doc, index) => {
+        console.log(`${index + 1}. ${doc.pageContent}`);
+    });
 }
 
 async function main() {
+    // Initialize vector store
+    await vectorStore.init();
+    console.log("✅ Vector store initialized");
+
     while (true) {
         try {
             // Wrap readline.question in a promise
