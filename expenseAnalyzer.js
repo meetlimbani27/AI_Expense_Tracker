@@ -1,14 +1,14 @@
 // Import required dependencies
 import dotenv from 'dotenv';
 import { ChatOpenAI } from "@langchain/openai";
-import { LLMChain } from "langchain/chains";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { LLMChain } from "langchain/chains";
 import readline from 'readline';
 import mongoose from 'mongoose';
 import Expense, { categories } from './models/Expense.js';
 import vectorStore from './services/vectorStore.js';
 
-// Load environment variables (including OpenAI API key)
+// Load environment variables
 dotenv.config();
 
 // Connect to MongoDB database
@@ -16,40 +16,116 @@ mongoose.connect('mongodb://localhost:27017/expense_tracker')
     .then(() => console.log('Connected to MongoDB'))
     .catch(err => console.error('MongoDB connection error:', err));
 
-// Initialize OpenAI chat model with specific settings
+// Initialize the language model with retry configuration
 const model = new ChatOpenAI({
     openAIApiKey: process.env.OPENAI_API_KEY,
-    temperature: 0.3,  // Lower temperature for more consistent outputs
-    modelName: "gpt-3.5-turbo"
+    temperature: 0.3,
+    modelName: "gpt-3.5-turbo",
+    maxRetries: 5,
+    maxConcurrency: 1,
+    timeout: 60000,
 });
 
-// Create the intent detection prompt to determine if user wants to add or retrieve expenses
+// Helper function to add delay between retries
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper function for retrying operations with exponential backoff
+async function withRetry(operation, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await operation();
+        } catch (error) {
+            if (error.message.includes('rate limit') && attempt < maxRetries) {
+                const delay = Math.min(1000 * Math.pow(2, attempt), 60000); // Max 1 minute delay
+                console.log(`⏳ Rate limit hit. Retrying in ${delay/1000} seconds...`);
+                await sleep(delay);
+            } else {
+                throw error;
+            }
+        }
+    }
+}
+
+// Create traced chain with retry logic
+function createTracedChain(chain, name) {
+    chain.tags = [`expense_tracker_${name}`];
+    return {
+        call: async (params) => withRetry(() => chain.call(params))
+    };
+}
+
+// Create the intent detection prompt
 const intentPrompt = ChatPromptTemplate.fromMessages([
-    ["system", 'You are an AI intent detector for an expense tracking system. Your task is to determine if the user wants to add a new expense or retrieve/search existing expenses.\n\n' +
-    'For adding expenses, look for phrases like:\n' +
-    '- "I spent..."\n' +
-    '- "paid for..."\n' +
-    '- "bought..."\n' +
-    '- Any mention of amounts or costs\n\n' +
-    'For retrieving expenses, look for phrases like:\n' +
-    '- "show me..."\n' +
-    '- "find..."\n' +
-    '- "what did I spend..."\n' +
-    '- "search for..."\n' +
-    '- Questions about past expenses\n\n' +
-    'Return a JSON object with these exact fields:\n' +
-    '- intent: either "add" or "retrieve"\n' +
-    '- confidence: a number between 0 and 1\n' +
-    '- originalText: the input text\n\n' +
-    'Return ONLY the JSON, no additional text.'],
+    ["system", "You are an AI assistant that helps users track their expenses. Your task is to determine the user's intent from their message."],
+    ["system", "There are only two possible intents:\n1. add - User wants to add a new expense (e.g., 'spent 500 on lunch', 'paid 1000 for groceries')\n2. retrieve - User wants to search or get information about past expenses (e.g., 'show food expenses', 'what did I spend on groceries')"],
+    ["system", "Respond with ONLY ONE of these exact words: 'add' or 'retrieve'"],
     ["human", "{text}"]
 ]);
 
-/**
- * Creates the expense analysis prompt with category validation
- * This function generates a prompt that helps the AI understand and categorize expenses
- * @returns {string} The formatted prompt string
- */
+// Create chains for different operations with retry logic
+const intentChain = createTracedChain(
+    new LLMChain({
+        llm: model,
+        prompt: intentPrompt
+    }),
+    "intent_detection"
+);
+
+const expenseChain = createTracedChain(
+    new LLMChain({
+        llm: model,
+        prompt: ChatPromptTemplate.fromMessages([
+            ["system", createExpensePrompt()],
+            ["human", "{text}"]
+        ])
+    }),
+    "expense_analysis"
+);
+
+const summaryChain = createTracedChain(
+    new LLMChain({
+        llm: model,
+        prompt: ChatPromptTemplate.fromMessages([
+            ["system", "You are an AI assistant that helps summarize expense data."],
+            ["system", "Given a list of expenses, provide a clear and concise summary focusing on:\n1. Total amount spent\n2. Category breakdown\n3. Notable patterns or insights"],
+            ["human", "{text}"]
+        ])
+    }),
+    "expense_summary"
+);
+
+const retrievalPrompt = ChatPromptTemplate.fromMessages([
+    ["system", `You are an AI assistant that helps analyze and summarize expense information.
+Given a user's query and a list of relevant expenses, provide a clear and helpful response.
+
+Guidelines:
+1. Calculate total amounts when relevant
+2. Group expenses by category if mentioned
+3. Highlight patterns or unusual expenses
+4. Keep the response concise but informative
+5. Use Indian Rupee (₹) for all amounts
+
+Example Query: "show my food expenses"
+Example Expenses: 
+- ₹500 for lunch at restaurant (Food)
+- ₹200 for snacks (Food)
+- ₹1000 for groceries (Food)
+
+Example Response:
+"I found 3 food-related expenses totaling ₹1,700. This includes ₹500 for lunch, ₹200 for snacks, and ₹1,000 for groceries."
+`],
+    ["human", "Query: {query}\nExpenses:\n{expenses}"]
+]);
+
+const retrievalChain = createTracedChain(
+    new LLMChain({
+        llm: model,
+        prompt: retrievalPrompt
+    }),
+    "retrieval_analysis"
+);
+
+// Helper function to create expense prompt
 function createExpensePrompt() {
     // Build category text from available categories
     let categoryText = 'Categories and their subcategories:\n';
@@ -80,61 +156,75 @@ IMPORTANT:
 Return ONLY the JSON object, no additional text.`;
 }
 
-// Create summary prompt for generating readable expense summaries
-const summaryPrompt = ChatPromptTemplate.fromMessages([
-    ["system", `You are an AI assistant that summarizes expense search results.
-Given a user's query and a list of relevant expenses, provide a concise and informative summary.
+// Format currency
+function formatCurrency(amount) {
+    return new Intl.NumberFormat('en-IN', {
+        style: 'currency',
+        currency: 'INR'
+    }).format(amount);
+}
 
-IMPORTANT RULES:
-1. Separate expenses by category - never combine amounts from different categories
-2. If searching for a specific category (e.g., "food"), only include expenses from that exact category
-3. For each category mentioned in the query:
-   - Show the total amount spent in that category
-   - List individual expenses within that category
-4. All amounts should be in Indian Rupees (₹)
-5. If a store sells multiple categories (e.g., DMart selling both food and groceries):
-   - Treat each category separately
-   - Do not combine amounts across categories
-   - Clearly indicate which expenses belong to which category
+// Main processing function with tracing and retry logic
+async function processUserInput(input) {
+    try {
+        // Detect intent with retry
+        const intentResult = await intentChain.call({ text: input });
+        const intent = intentResult.text.toLowerCase().trim();
 
-Example Summary Format:
-"For [category]:
-- Total spent: ₹X
-- Individual expenses:
-  * ₹A at [place] on [date]
-  * ₹B at [place] on [date]
+        // Process based on intent
+        switch (intent) {
+            case 'add': {
+                console.log('💭 Understanding your expense...');
+                const analysis = await expenseChain.call({ text: input });
+                const expenseData = JSON.parse(analysis.text);
+                
+                // Create and save expense
+                const expense = new Expense({
+                    amount: expenseData.amount,
+                    category: expenseData.category,
+                    subCategory: expenseData['sub-category'] || [],
+                    response: expenseData.response
+                });
+                
+                await expense.save();
+                await vectorStore.addExpense(expense);
+                
+                console.log('✅ Expense saved:');
+                console.log(`   Amount: ${formatCurrency(expense.amount)}`);
+                console.log(`   Category: ${expense.category}`);
+                if (expense.subCategory && expense.subCategory.length > 0) {
+                    console.log(`   Subcategories: ${expense.subCategory.join(', ')}`);
+                }
+                console.log(`   Description: ${expense.response}`);
+                break;
+            }
+            case 'retrieve': {
+                console.log('🔍 Analyzing your expenses...');
+                // First, get relevant expenses using vector search
+                const results = await vectorStore.similaritySearch(input);
+                
+                if (results.length === 0) {
+                    console.log('❌ No matching expenses found.');
+                    break;
+                }
 
-For [another category]:
-- Total spent: ₹Y
-- Individual expenses:
-  * ₹C at [place] on [date]"
-
-Keep the summary clear, organized by category, and never mix expenses from different categories.`],
-    ["human", `Query: {query}
-Relevant expenses:
-{expenses}
-
-Provide a summary of these expenses, strictly separating different categories:`]
-]);
-
-// Create the LangChain chains for different functionalities
-const intentChain = new LLMChain({
-    llm: model,
-    prompt: intentPrompt
-});
-
-const expenseChain = new LLMChain({
-    llm: model,
-    prompt: ChatPromptTemplate.fromMessages([
-        ["system", createExpensePrompt()],
-        ["human", "{text}"]
-    ])
-});
-
-const summaryChain = new LLMChain({
-    llm: model,
-    prompt: summaryPrompt
-});
+                // Format expenses for the analysis
+                const expensesText = results.map(r => r.pageContent).join('\n');
+                
+                // Generate analysis of the expenses
+                const analysis = await retrievalChain.call({
+                    query: input,
+                    expenses: expensesText
+                });
+                
+                console.log('\n📊 ' + analysis.text);
+                break;
+            }
+        }
+    } catch (error) {
+        console.error('❌ Error:', error.message);
+    }
+}
 
 // Create readline interface for CLI interaction
 const rl = readline.createInterface({
@@ -142,110 +232,18 @@ const rl = readline.createInterface({
     output: process.stdout
 });
 
-/**
- * Handles the addition of a new expense
- * @param {string} text - The user's input text describing the expense
- */
-async function handleAddExpense(text) {
-    // Analyze the expense using AI
-    const result = await expenseChain.call({ text });
-    const expenseData = JSON.parse(result.text);
+console.log('👋 Welcome to your AI Expense Tracker!');
+console.log('You can:');
+console.log('  - Add expenses (e.g., "spent 500 on lunch")');
+console.log('  - Ask about expenses (e.g., "show me food expenses", "what did I spend on groceries last week?")');
+console.log('\nEnter your request (or type "q" to quit):');
 
-    // Create and save the expense in MongoDB
-    const newExpense = new Expense({
-        amount: expenseData.amount,
-        category: expenseData.category,
-        subCategory: expenseData['sub-category'],
-        response: expenseData.response
-    });
-
-    await newExpense.save();
-    
-    // Add to vector store for semantic search
-    await vectorStore.addExpense(newExpense);
-    
-    console.log("Analysis:", result.text);
-    console.log("✅ Expense saved to database and vector store");
-}
-
-/**
- * Handles expense retrieval and summarization
- * @param {string} text - The user's search query
- */
-async function handleRetrieveExpense(text) {
-    console.log("🔍 Searching expenses...");
-    
-    // Search in vector store using semantic similarity
-    const searchResults = await vectorStore.similaritySearch(text);
-    
-    if (searchResults.length === 0) {
-        console.log("❌ No relevant expenses found");
-        return;
+rl.on('line', async (input) => {
+    if (input.toLowerCase() === 'q') {
+        console.log('👋 Goodbye!');
+        rl.close();
+        process.exit(0);
     }
-
-    // Format expenses for summary
-    const expensesText = searchResults
-        .map(doc => doc.pageContent)
-        .join('\n');
-
-    // Generate an AI-powered summary of the expenses
-    const summary = await summaryChain.call({
-        query: text,
-        expenses: expensesText
-    });
-
-    console.log("\n📊 Summary:");
-    console.log(summary.text);
-    
-    console.log("\n📝 Relevant Expenses:");
-    searchResults.forEach((doc, index) => {
-        console.log(`${index + 1}. ${doc.pageContent}`);
-    });
-}
-
-/**
- * Main application loop
- * Handles user interaction and routes to appropriate handlers
- */
-async function main() {
-    // Initialize vector store for semantic search
-    await vectorStore.init();
-    console.log("✅ Vector store initialized");
-
-    while (true) {
-        try {
-            // Get user input
-            const userInput = await new Promise((resolve) => {
-                rl.question('Enter your request (or type "q" to quit): ', resolve);
-            });
-
-            // Check for quit command
-            if (userInput.toLowerCase() === 'q') {
-                console.log('Goodbye!');
-                rl.close();
-                await mongoose.connection.close();
-                break;
-            }
-
-            // Detect user intent using AI
-            const intentResult = await intentChain.call({ text: userInput });
-            const { intent, confidence } = JSON.parse(intentResult.text);
-            
-            console.log(`🤖 Detected intent: ${intent} (confidence: ${(confidence * 100).toFixed(1)}%)`);
-
-            // Route to appropriate handler based on intent
-            if (intent === 'add') {
-                await handleAddExpense(userInput);
-            } else {
-                await handleRetrieveExpense(userInput);
-            }
-            
-            console.log('-------------------');
-        } catch (error) {
-            console.error("Error:", error);
-        }
-    }
-}
-
-// Start the application
-main();
+    await processUserInput(input);
+    console.log('\nEnter your request (or type "q" to quit):');
+});
