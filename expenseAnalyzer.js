@@ -1,3 +1,4 @@
+// Import required dependencies
 import dotenv from 'dotenv';
 import { ChatOpenAI } from "@langchain/openai";
 import { LLMChain } from "langchain/chains";
@@ -7,22 +8,22 @@ import mongoose from 'mongoose';
 import Expense, { categories } from './models/Expense.js';
 import vectorStore from './services/vectorStore.js';
 
-// Load environment variables
+// Load environment variables (including OpenAI API key)
 dotenv.config();
 
-// Connect to MongoDB
+// Connect to MongoDB database
 mongoose.connect('mongodb://localhost:27017/expense_tracker')
     .then(() => console.log('Connected to MongoDB'))
     .catch(err => console.error('MongoDB connection error:', err));
 
-// Initialize the OpenAI chat model
+// Initialize OpenAI chat model with specific settings
 const model = new ChatOpenAI({
     openAIApiKey: process.env.OPENAI_API_KEY,
-    temperature: 0.3,
+    temperature: 0.3,  // Lower temperature for more consistent outputs
     modelName: "gpt-3.5-turbo"
 });
 
-// Create the intent detection prompt
+// Create the intent detection prompt to determine if user wants to add or retrieve expenses
 const intentPrompt = ChatPromptTemplate.fromMessages([
     ["system", 'You are an AI intent detector for an expense tracking system. Your task is to determine if the user wants to add a new expense or retrieve/search existing expenses.\n\n' +
     'For adding expenses, look for phrases like:\n' +
@@ -44,10 +45,14 @@ const intentPrompt = ChatPromptTemplate.fromMessages([
     ["human", "{text}"]
 ]);
 
-// Create the expense analysis prompt
+/**
+ * Creates the expense analysis prompt with category validation
+ * This function generates a prompt that helps the AI understand and categorize expenses
+ * @returns {string} The formatted prompt string
+ */
 function createExpensePrompt() {
+    // Build category text from available categories
     let categoryText = 'Categories and their subcategories:\n';
-    
     for (const [category, subcategories] of Object.entries(categories)) {
         categoryText += `- ${category}: ${JSON.stringify(subcategories)}\n`;
     }
@@ -75,7 +80,7 @@ IMPORTANT:
 Return ONLY the JSON object, no additional text.`;
 }
 
-// Create summary prompt for search results
+// Create summary prompt for generating readable expense summaries
 const summaryPrompt = ChatPromptTemplate.fromMessages([
     ["system", `You are an AI assistant that summarizes expense search results.
 Given a user's query and a list of relevant expenses, provide a concise and informative summary.
@@ -112,7 +117,7 @@ Relevant expenses:
 Provide a summary of these expenses, strictly separating different categories:`]
 ]);
 
-// Create the chains
+// Create the LangChain chains for different functionalities
 const intentChain = new LLMChain({
     llm: model,
     prompt: intentPrompt
@@ -131,13 +136,18 @@ const summaryChain = new LLMChain({
     prompt: summaryPrompt
 });
 
-// Create readline interface
+// Create readline interface for CLI interaction
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
 });
 
+/**
+ * Handles the addition of a new expense
+ * @param {string} text - The user's input text describing the expense
+ */
 async function handleAddExpense(text) {
+    // Analyze the expense using AI
     const result = await expenseChain.call({ text });
     const expenseData = JSON.parse(result.text);
 
@@ -151,17 +161,21 @@ async function handleAddExpense(text) {
 
     await newExpense.save();
     
-    // Add to vector store
+    // Add to vector store for semantic search
     await vectorStore.addExpense(newExpense);
     
     console.log("Analysis:", result.text);
     console.log("✅ Expense saved to database and vector store");
 }
 
+/**
+ * Handles expense retrieval and summarization
+ * @param {string} text - The user's search query
+ */
 async function handleRetrieveExpense(text) {
     console.log("🔍 Searching expenses...");
     
-    // Search in vector store
+    // Search in vector store using semantic similarity
     const searchResults = await vectorStore.similaritySearch(text);
     
     if (searchResults.length === 0) {
@@ -174,7 +188,7 @@ async function handleRetrieveExpense(text) {
         .map(doc => doc.pageContent)
         .join('\n');
 
-    // Generate summary
+    // Generate an AI-powered summary of the expenses
     const summary = await summaryChain.call({
         query: text,
         expenses: expensesText
@@ -189,19 +203,23 @@ async function handleRetrieveExpense(text) {
     });
 }
 
+/**
+ * Main application loop
+ * Handles user interaction and routes to appropriate handlers
+ */
 async function main() {
-    // Initialize vector store
+    // Initialize vector store for semantic search
     await vectorStore.init();
     console.log("✅ Vector store initialized");
 
     while (true) {
         try {
-            // Wrap readline.question in a promise
+            // Get user input
             const userInput = await new Promise((resolve) => {
                 rl.question('Enter your request (or type "q" to quit): ', resolve);
             });
 
-            // Check if user wants to exit
+            // Check for quit command
             if (userInput.toLowerCase() === 'q') {
                 console.log('Goodbye!');
                 rl.close();
@@ -209,13 +227,13 @@ async function main() {
                 break;
             }
 
-            // First, detect the intent
+            // Detect user intent using AI
             const intentResult = await intentChain.call({ text: userInput });
             const { intent, confidence } = JSON.parse(intentResult.text);
             
             console.log(`🤖 Detected intent: ${intent} (confidence: ${(confidence * 100).toFixed(1)}%)`);
 
-            // Handle the intent
+            // Route to appropriate handler based on intent
             if (intent === 'add') {
                 await handleAddExpense(userInput);
             } else {
@@ -229,4 +247,5 @@ async function main() {
     }
 }
 
+// Start the application
 main();
