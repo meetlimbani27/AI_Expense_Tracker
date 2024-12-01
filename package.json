@@ -8,11 +8,11 @@
     "start": "node app.js"
   },
   "dependencies": {
-    "langchain": "^0.0.200",
-    "dotenv": "^16.3.1",
-    "@langchain/openai": "^0.0.10",
-    "mongoose": "^8.0.3",
     "@langchain/community": "^0.0.10",
-    "hnswlib-node": "^1.4.2"
+    "@langchain/openai": "^0.0.10",
+    "@qdrant/js-client-rest": "^1.7.0",
+    "dotenv": "^16.3.1",
+    "langchain": "^0.3.6",
+    "mongoose": "^8.8.3"
   }
 }

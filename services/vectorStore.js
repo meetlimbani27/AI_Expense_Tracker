@@ -1,75 +1,77 @@
 // Import required dependencies for vector storage and embeddings
 import { OpenAIEmbeddings } from "@langchain/openai";
-import { HNSWLib } from "@langchain/community/vectorstores/hnswlib";
-import { Document } from "@langchain/core/documents";
-import { mkdirSync, existsSync } from 'fs';
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
+import { QdrantClient } from "@qdrant/js-client-rest";
+import { QdrantVectorStore } from "@langchain/community/vectorstores/qdrant";
+import { randomUUID } from 'crypto';
 import dotenv from 'dotenv';
 
 // Load environment variables for API keys
 dotenv.config();
 
-// Set up file paths for vector store
-// Using ES modules requires special handling for __dirname
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const VECTOR_STORE_PATH = join(__dirname, '..', 'vector_store');
-const VECTOR_INDEX_PATH = join(VECTOR_STORE_PATH, 'hnswlib.index');
-
-// Create vector store directory if it doesn't exist
-if (!existsSync(VECTOR_STORE_PATH)) {
-    mkdirSync(VECTOR_STORE_PATH, { recursive: true });
-}
+// Qdrant collection configuration
+const COLLECTION_NAME = "expenses";
+const VECTOR_SIZE = 1536; // OpenAI embeddings dimension
 
 /**
  * VectorStoreService class
- * Handles the storage and retrieval of expense embeddings for semantic search
+ * Handles the storage and retrieval of expense embeddings for semantic search using Qdrant Cloud
  */
 class VectorStoreService {
     constructor() {
-        // Ensure OpenAI API key is available
-        if (!process.env.OPENAI_API_KEY) {
-            throw new Error("OPENAI_API_KEY is required in .env file");
+        // Ensure required environment variables are available
+        const requiredEnvVars = ['OPENAI_API_KEY', 'QDRANT_URL', 'QDRANT_API_KEY'];
+        for (const envVar of requiredEnvVars) {
+            if (!process.env[envVar]) {
+                throw new Error(`${envVar} is required in .env file`);
+            }
         }
 
         // Initialize OpenAI embeddings with API key
         this.embeddings = new OpenAIEmbeddings({
             openAIApiKey: process.env.OPENAI_API_KEY
         });
+
+        // Initialize Qdrant client with cloud configuration
+        this.client = new QdrantClient({
+            url: process.env.QDRANT_URL,
+            apiKey: process.env.QDRANT_API_KEY
+        });
+
         this.vectorStore = null;
-        this.documents = [];
     }
 
     /**
      * Initialize the vector store
-     * Either loads existing store or creates a new one
+     * Creates Qdrant collection if it doesn't exist
      */
     async init() {
         try {
-            if (existsSync(VECTOR_INDEX_PATH)) {
-                // Load existing vector store if available
-                this.vectorStore = await HNSWLib.load(
-                    VECTOR_STORE_PATH,
-                    this.embeddings
-                );
-                console.log("Loaded existing vector store");
-            } else {
-                // Create new vector store with a dummy document
-                // This is needed to initialize the store properly
-                const dummyDoc = new Document({
-                    pageContent: "Initialization document",
-                    metadata: { initialization: true }
+            // Check if collection exists
+            const collections = await this.client.getCollections();
+            const collectionExists = collections.collections.some(
+                collection => collection.name === COLLECTION_NAME
+            );
+
+            if (!collectionExists) {
+                // Create new collection with proper configuration
+                await this.client.createCollection(COLLECTION_NAME, {
+                    vectors: {
+                        size: VECTOR_SIZE,
+                        distance: "Cosine"
+                    }
                 });
-                
-                this.vectorStore = await HNSWLib.fromDocuments(
-                    [dummyDoc],
-                    this.embeddings
-                );
-                await this.vectorStore.save(VECTOR_STORE_PATH);
-                console.log("Created new vector store");
+
+                console.log("✅ Created new Qdrant collection");
             }
+
+            // Initialize vector store with Qdrant
+            this.vectorStore = new QdrantVectorStore(this.client, this.embeddings, {
+                collectionName: COLLECTION_NAME,
+            });
+
+            console.log("✅ Connected to Qdrant Cloud");
         } catch (error) {
-            console.error("Error initializing vector store:", error);
+            console.error("Error initializing Qdrant store:", error);
             throw error;
         }
     }
@@ -85,59 +87,128 @@ class VectorStoreService {
      * @returns {Promise<boolean>} Success indicator
      */
     async addExpense(expense) {
-        // Create metadata object for the expense
-        const metadata = {
-            id: expense._id.toString(),
-            amount: expense.amount,
-            category: expense.category,
-            subCategory: expense.subCategory,
-            date: expense.createdAt.toISOString()
-        };
+        try {
+            if (!this.vectorStore) {
+                await this.init();
+            }
 
-        // Create a rich text representation of the expense with clear category distinction
-        // This format helps in semantic search and category separation
-        const textContent = `[${expense.category.toUpperCase()}] Expense of ₹${expense.amount} for ${expense.response} 
-        (Category: ${expense.category}, Subcategories: ${expense.subCategory.join(', ')}) 
-        on ${expense.createdAt.toLocaleDateString()}`;
+            // Create metadata for the expense
+            const metadata = {
+                id: expense._id.toString(),
+                amount: expense.amount,
+                category: expense.category,
+                subCategory: expense.subCategory,
+                date: expense.createdAt.toISOString()
+            };
 
-        // Create a document for vector storage
-        const doc = new Document({
-            pageContent: textContent,
-            metadata: metadata
-        });
+            // Create a rich text representation of the expense
+            const textContent = `[${expense.category.toUpperCase()}] Expense of ₹${expense.amount} for ${expense.response} 
+            (Category: ${expense.category}, Subcategories: ${expense.subCategory.join(', ')}) 
+            on ${expense.createdAt.toLocaleDateString()}`;
 
-        // Initialize vector store if needed
-        if (!this.vectorStore) {
-            await this.init();
+            // Create embeddings and add to Qdrant
+            const embedding = await this.embeddings.embedQuery(textContent);
+            await this.client.upsert(COLLECTION_NAME, {
+                wait: true,
+                points: [{
+                    id: randomUUID(),
+                    payload: {
+                        mongoId: metadata.id,
+                        ...metadata,
+                        content: textContent
+                    },
+                    vector: embedding
+                }]
+            });
+
+            return true;
+        } catch (error) {
+            console.error("Error adding expense to Qdrant:", error);
+            throw error;
         }
-
-        // Add document to vector store and save
-        await this.vectorStore.addDocuments([doc]);
-        await this.vectorStore.save(VECTOR_STORE_PATH);
-        
-        return true;
     }
 
     /**
      * Search for similar expenses using semantic search
-     * @param {string} query - The search query
-     * @param {number} k - Number of results to return
-     * @returns {Promise<Array>} Array of matching documents
      */
     async similaritySearch(query, k = 5) {
-        // Initialize vector store if needed
-        if (!this.vectorStore) {
-            await this.init();
-        }
-
         try {
-            // Perform similarity search
-            const results = await this.vectorStore.similaritySearch(query, k);
-            // Filter out the initialization document if it exists
-            return results.filter(doc => !doc.metadata?.initialization);
+            if (!this.vectorStore) {
+                await this.init();
+            }
+
+            // Create query embedding
+            const queryEmbedding = await this.embeddings.embedQuery(query);
+
+            // Search in Qdrant
+            const searchResult = await this.client.search(COLLECTION_NAME, {
+                vector: queryEmbedding,
+                limit: k,
+                with_payload: true
+            });
+
+            // Format results
+            return searchResult.map(result => ({
+                pageContent: result.payload.content,
+                metadata: {
+                    id: result.payload.mongoId,
+                    amount: result.payload.amount,
+                    category: result.payload.category,
+                    subCategory: result.payload.subCategory,
+                    date: result.payload.date,
+                    score: result.score
+                }
+            }));
         } catch (error) {
             console.error("Error during similarity search:", error);
             return [];
+        }
+    }
+
+    /**
+     * Delete an expense from the vector store
+     * @param {string} expenseId - MongoDB ID of the expense to delete
+     * @returns {Promise<boolean>} Success indicator
+     */
+    async deleteExpense(expenseId) {
+        try {
+            if (!this.vectorStore) {
+                await this.init();
+            }
+
+            // Delete points with matching metadata.id
+            await this.client.delete(COLLECTION_NAME, {
+                filter: {
+                    must: [
+                        {
+                            key: "payload.mongoId",
+                            match: { value: expenseId }
+                        }
+                    ]
+                }
+            });
+
+            return true;
+        } catch (error) {
+            console.error("Error deleting expense from Qdrant:", error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update an expense in the vector store
+     * @param {Object} expense - Updated expense object
+     * @returns {Promise<boolean>} Success indicator
+     */
+    async updateExpense(expense) {
+        try {
+            // Delete old version and add new version
+            await this.deleteExpense(expense._id.toString());
+            await this.addExpense(expense);
+            return true;
+        } catch (error) {
+            console.error("Error updating expense in Qdrant:", error);
+            throw error;
         }
     }
 }
