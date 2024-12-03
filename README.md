@@ -60,6 +60,54 @@ QDRANT_URL=your_qdrant_url
 QDRANT_API_KEY=your_qdrant_api_key
 ```
 
+## LangSmith Tracing
+
+This project includes LangSmith integration for monitoring and debugging LangChain applications. LangSmith provides:
+- Detailed traces of all LangChain runs
+- Debug information for prompts and completions
+- Performance metrics and token usage
+- Feedback and evaluation tools
+
+### Setting up LangSmith
+
+1. Create a LangSmith account at [cloud.langsmith.com](https://cloud.langsmith.com)
+
+2. Add these environment variables to your `.env` file:
+```bash
+# Required for all implementations
+OPENAI_API_KEY=your_openai_api_key
+
+# LangSmith Configuration
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_ENDPOINT="https://api.smith.langchain.com"
+LANGCHAIN_API_KEY=your_langsmith_api_key
+LANGCHAIN_PROJECT=your_project_name  # Optional, defaults to "default"
+
+# Additional keys for Qdrant implementation (if using qdrant_vectorstore branch)
+QDRANT_URL=your_qdrant_url
+QDRANT_API_KEY=your_qdrant_api_key
+```
+
+3. Access your traces:
+   - Go to [cloud.langsmith.com](https://cloud.langsmith.com)
+   - Navigate to your project
+   - View detailed traces of your runs
+
+### What's Being Traced
+
+The following operations are traced in LangSmith:
+- Expense categorization chains
+- Intent detection
+- Vector store operations
+- Expense summarization
+- All LLM calls and their responses
+
+This helps in:
+- Debugging incorrect categorizations
+- Optimizing prompt performance
+- Monitoring token usage
+- Improving response quality
+
 ## Prerequisites
 
 - Node.js (v14 or higher)
@@ -83,6 +131,12 @@ npm install
 ```bash
 # Required for all implementations
 OPENAI_API_KEY=your_openai_api_key
+
+# LangSmith Configuration
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_ENDPOINT="https://api.smith.langchain.com"
+LANGCHAIN_API_KEY=your_langsmith_api_key
+LANGCHAIN_PROJECT=your_project_name  # Optional, defaults to "default"
 
 # Additional keys for Qdrant implementation (if using qdrant_vectorstore branch)
 QDRANT_URL=your_qdrant_url
